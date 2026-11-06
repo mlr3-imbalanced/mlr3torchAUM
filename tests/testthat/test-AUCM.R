@@ -750,4 +750,68 @@ if (torch::torch_is_installed() && requireNamespace("mlr3torch")) {
     expect_false(any(is.nan(as.numeric(scores$grad))))
     expect_equal(length(as.numeric(scores$grad)), length(prob))
   })
+
+  pesg_decay_learner <- function(neurons, epochs, decay_epochs, spy = NULL) {
+    set.seed(1)
+    torch::torch_manual_seed(1)
+    n <- 200
+    x1 <- rnorm(n)
+    x2 <- rnorm(n)
+    y <- factor(ifelse(plogis(1.5 * x1 - x2) > 0.6, "pos", "neg"), levels = c("pos", "neg"))
+    task <- mlr3::TaskClassif$new("t", data.frame(x1, x2, y), target = "y", positive = "pos")
+    L <- mlr3torch::LearnerTorchMLP$new(task_type = "classif")
+    L$loss <- mlr3torch::as_torch_loss(nn_AUCM_loss) # add_sigmoid = TRUE, the MLP head emits logits
+    pesg_args <- list(
+      lr = 0.1, clamp_value = 1, weight_decay = 1e-4,
+      epoch_decay = 1e-3, momentum = 0.9, decay_factor = 2)
+    opt <- mlr3torch::as_torch_optimizer(optim_pesg)
+    do.call(opt$param_set$set_values, pesg_args)
+    L$optimizer <- opt
+    cb <- do.call(make_pesg_callback_full, c(pesg_args, list(decay_epochs = decay_epochs)))
+    L$callbacks <- if (is.null(spy)) cb else list(cb, spy)
+    L$predict_type <- "prob"
+    L$param_set$set_values(epochs = epochs, batch_size = 32, neurons = neurons, shuffle = TRUE, seed = 1)
+    L$train(task)
+    list(learner = L, task = task)
+  }
+
+  test_that("make_pesg_callback_full checks decay_epochs", {
+    skip_on_cran()
+    args <- list(
+      lr = 0.1, clamp_value = 1, weight_decay = 0,
+      epoch_decay = 0, momentum = 0.9, decay_factor = 2)
+    for (bad in list(0, -1, 1.5, "2", NA_real_)) {
+      expect_error(
+        do.call(make_pesg_callback_full, c(args, list(decay_epochs = bad))),
+        "decay_epochs")
+    }
+    cb <- do.call(make_pesg_callback_full, c(args, list(decay_epochs = c(5, 10))))
+    expect_true(inherits(cb, "TorchCallback"))
+  })
+
+  test_that("PESG decays lr only at decay_epochs", {
+    skip_on_cran()
+    lr_after_epoch <- function(decay_epochs) {
+      lr_seen <- c()
+      spy <- mlr3torch::torch_callback("lr_spy", on_epoch_end = function() {
+        lr_seen <<- c(lr_seen, self$ctx$optimizer$param_groups[[1]]$lr)
+      })
+      pesg_decay_learner(neurons = 4, epochs = 5, decay_epochs = decay_epochs, spy = spy)
+      lr_seen
+    }
+    # NULL keeps the old behaviour: divide by decay_factor after every epoch
+    expect_equal(lr_after_epoch(NULL), 0.1 / 2^(1:5), tolerance = 1e-9)
+    expect_equal(lr_after_epoch(c(2, 4)), c(0.1, 0.05, 0.05, 0.025, 0.025), tolerance = 1e-9)
+  })
+
+  test_that("e2e PESG with decay_epochs does not invert AUC (#95)", {
+    skip_on_cran()
+    # Decaying after every epoch made lr vanish after a few epochs, freezing
+    # a/b in an inverted solution (AUC ~0.04 with these settings).
+    res <- pesg_decay_learner(neurons = 8, epochs = 30, decay_epochs = 20)
+    loss_fn <- res$learner$model$loss_fn
+    expect_gt(res$learner$predict(res$task)$score(mlr3::msr("classif.auc")), 0.9)
+    expect_gt(as.numeric(loss_fn$a), as.numeric(loss_fn$b))
+    expect_gte(as.numeric(loss_fn$alpha), 0)
+  })
 }

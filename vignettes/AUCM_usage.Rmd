@@ -69,7 +69,8 @@ if(torch_available){
     L$callbacks <- list(mlr3torch::t_clbk("history"), 
     mlr3torchAUM::make_pesg_callback_full(
       lr = 0.01, clamp_value = 1, weight_decay = 1e-4,
-      epoch_decay = 1e-3, momentum = 0.9, decay_factor = 2
+      epoch_decay = 1e-3, momentum = 0.9, decay_factor = 2,
+      decay_epochs = c(10, 15) # decay only after these epochs, not every epoch
     ))
     L$param_set$set_values(
       epochs=20, batch_size=32, seed=1,

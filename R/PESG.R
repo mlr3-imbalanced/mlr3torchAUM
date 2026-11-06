@@ -45,6 +45,19 @@ pesg_update_lr <- function(lr, decay_factor) {
   return(lr / decay_factor)
 }
 
+pesg_check_decay_epochs <- function(decay_epochs) {
+  if (is.null(decay_epochs)) return(invisible(NULL))
+  if (!is.numeric(decay_epochs) || anyNA(decay_epochs) ||
+    any(decay_epochs < 1) || any(decay_epochs != round(decay_epochs))) {
+    stop("decay_epochs must be NULL or a vector of positive integers")
+  }
+}
+
+pesg_is_decay_epoch <- function(epoch, decay_epochs) {
+  # NULL: decay after every epoch; otherwise only at the given epochs (as LibAUC)
+  is.null(decay_epochs) || epoch %in% decay_epochs
+}
+
 optim_pesg <- torch::optimizer(
   initialize = function(
     params, lr, clamp_value, weight_decay,
@@ -178,8 +191,9 @@ make_pesg_callback <- function(lr = 0.05, mode = "sgd", ...) {
 
 make_pesg_callback_full <- function(
   lr, clamp_value, weight_decay,
-  epoch_decay, momentum, decay_factor
+  epoch_decay, momentum, decay_factor, decay_epochs = NULL
 ) {
+  pesg_check_decay_epochs(decay_epochs)
   state_a <- NULL
   state_b <- NULL
   lr_ab <- lr
@@ -195,6 +209,7 @@ make_pesg_callback_full <- function(
       state_b <<- res$state_b
     },
     on_epoch_end = function() {
+      if (!pesg_is_decay_epoch(self$ctx$epoch, decay_epochs)) return(invisible(NULL))
       self$ctx$optimizer$update_regularizer() # network weights
       self$ctx$optimizer$update_lr() # network weights
       reg_a <- pesg_update_regularizer(state_a$model_acc, state_a$T)

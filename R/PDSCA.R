@@ -141,8 +141,9 @@ optim_pdsca <- torch::optimizer(
 
 make_pdsca_callback <- function(
   lr, clamp_value, weight_decay,
-  epoch_decay, momentum, decay_factor
+  epoch_decay, momentum, decay_factor, decay_epochs = NULL
 ) {
+  pesg_check_decay_epochs(decay_epochs)
   state_a <- NULL
   state_b <- NULL
   lr_ab <- lr
@@ -175,6 +176,7 @@ make_pdsca_callback <- function(
       opt$loss_ref <- loss_fn
     },
     on_epoch_end = function() {
+      if (!pesg_is_decay_epoch(self$ctx$epoch, decay_epochs)) return(invisible(NULL))
       self$ctx$optimizer$update_regularizer()
       self$ctx$optimizer$update_lr()
       if (!is.null(state_a)) {

@@ -1,3 +1,12 @@
+Changes in version 2026.11.6
+
+- make_pesg_callback_full() and make_pdsca_callback() gain a decay_epochs
+  argument (as in LibAUC): the proximal reference is refreshed and the
+  learning rates are divided by decay_factor only after the given epochs.
+  NULL (default) keeps decaying after every epoch, which shrinks the
+  learning rate geometrically and could freeze training in an inverted
+  solution (AUC < 0.5), see #95. Vignettes now use decay_epochs.
+
 Changes in version 2026.9.5
 
 - torch_loss_weighted_logistic implemented for binary classification in mlr3torch, supporting automatic inverse class frequency weighting and custom cost matrices.
