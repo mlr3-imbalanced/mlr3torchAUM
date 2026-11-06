@@ -29,7 +29,7 @@ Draw_ROC_curve_micro <- function(pred_tensor, label_tensor){
     TPR = TPR
     )
   ggplot(dt, aes(x = FPR, y = TPR)) +
-    geom_line(color = "blue", size = 1) +
+    geom_line(color = "blue", linewidth = 1) +
     theme_minimal() +
     labs(
       title = "Roc curve using micro average",
