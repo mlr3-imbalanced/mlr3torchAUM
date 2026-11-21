@@ -11,54 +11,223 @@ knitr::opts_chunk$set(
 data.table::setDTthreads(1L)
 ```
 
-# Maximizing AUC with the AUCM loss
+# Maximizing AUC with the AUCM Loss (v1 and v2)
 
-AUCM is a loss function ported from LibAUC library.
-It is a differentiable surrogate for AUC Loss specialized in imbalanced classification.
+AUCM (Area Under the ROC Curve Margin) is a surrogate loss ported from the
+[LibAUC](https://libauc.org/) library (Yuan et al., ICCV 2021). It is designed
+for directly optimizing the Area Under the ROC Curve (ROC-AUC) in binary
+classification problems with severe class imbalance.
 
-It adopts the min-max idea:
-"a" should be the mean of the score of positive samples,
-and "b" should be the mean of the score of negative samples.
-The square error of "a" and "b" and their corresponding mean are minimized.
+## Why AUCM for Imbalanced Data?
 
-"alpha" is a dual variable which should be maximized.
-"margin" is the desired gap of the positives and negatives.
-"alpha" is a force that push the "a" and "b" apart to reach the value of the "margin".
+In imbalanced classification, traditional surrogate losses like binary
+cross-entropy (logistic loss) focus on probability calibration and treat false
+positives and false negatives symmetrically across observations. When the negative
+class heavily outnumbers the positive class, cross-entropy gradients are dominated
+by the majority class, often leading the model to output conservative probabilities
+close to zero for all samples.
 
-Why?
-First, mlr3torch's optimizer can't reach to the parameters in loss functions.
-Second, "alpha", the dual variable, needs gradient ascent, which should be managed independently.
+AUC measures the ranking quality of predictions: the probability that a randomly
+chosen positive instance receives a higher predicted score than a randomly chosen
+negative instance:
 
-## Create an imbalanced version of spam data set
+$$\text{AUC} = \mathbb{P}(f(\mathbf{x}) \ge f(\mathbf{x}') \mid y = 1, y' = 0)$$
 
-```{r}
-spam_task <- mlr3::tsk("spam")
-spam_task$filter(1504:4293) # for imbalance.  310    2480 
-Class_vec <- spam_task$data(spam_task$row_ids, "type")$type
-(count_tab <- table(Class_vec))
-print(count_tab/sum(count_tab))
-library(data.table)
-orig_X_dt <- spam_task$data(spam_task$row_ids, spam_task$col_roles$feature)
-sc_X_dt <- data.table(type=Class_vec, scale(orig_X_dt))
-spam_sc_task <- mlr3::TaskClassif$new("spam_sc", sc_X_dt, target="type")
-spam_sc_task$col_roles$stratum <- "type"
-spam_list <- list(task=spam_sc_task)
-```
+Because the indicator function in the empirical AUC is non-differentiable, AUCM
+approximates the Wilcoxon-Mann-Whitney statistic using a squared hinge surrogate
+and reformulates it as a min-max saddle point problem:
 
-## Run the Benchmark
+$$\min_{\mathbf{w}, a, b} \max_{\alpha \ge 0} \mathcal{L}(\mathbf{w}, a, b, \alpha)$$
+
+This formulation introduces three auxiliary variables alongside the neural network weights $\mathbf{w}$:
+
+* **$a \in \mathbb{R}$**: The surrogate center (mean prediction score) for the positive class ($y = 1$).
+* **$b \in \mathbb{R}$**: The surrogate center (mean prediction score) for the negative class ($y = 0$).
+* **$\text{margin}$ ($m \ge 0$)**: The desired gap between positive and negative predictions (default $m = 1$).
+* **$\alpha \ge 0$**: A dual variable (Lagrange multiplier) that acts as an adaptive force pushing $a$ and $b$ apart until $a - b \ge m$.
+
+## Optimization Mechanics: PESG Optimizer and Callback
+
+Training with AUCM requires specialized optimization handling for two reasons:
+
+1. **Loss Parameter Encapsulation**: In `mlr3torch`, the learner's optimizer only updates the neural network weights $\mathbf{w}$. The loss module's internal parameters ($a$, $b$, $\alpha$) live outside the network parameter list.
+2. **Min-Max Dynamics**: While $a$, $b$, and $\mathbf{w}$ are minimized via gradient descent, the dual variable $\alpha$ must be maximized via gradient ascent and constrained to be non-negative ($\alpha \ge 0$).
+
+To handle this, `mlr3torchAUM` provides:
+
+* `optim_pesg`: An implementation of the Proximal Epoch-wise Stochastic Gradient (PESG) algorithm for updating the network parameters $\mathbf{w}$.
+* `make_pesg_callback_full` (or `make_pesg_callback`): An `mlr3torch` callback that descends $a$ and $b$, ascends $\alpha$ with non-negative clamping after each backward pass (`on_after_backward`), and updates proximal regularizers and learning rates at epoch boundaries (`on_epoch_end`).
+
+---
+
+## AUCM Formulations: Version 1 vs Version 2
+
+The package provides two versions of the AUCM loss via the `version` argument in `nn_AUCM_loss()` and `AUCM()`.
+
+### AUCM v1: Prior-Weighted Formulation
+
+AUCM v1 is the original LibAUC formulation. It computes expectations over the entire batch and weights positive and negative terms by the class prior $p = \mathbb{P}(y = 1)$:
+
+$$\mathcal{L}_{v1} = (1 - p)\mathbb{E}[(s - a)^2 \mathbb{I}(y = 1)] + p\mathbb{E}[(s - b)^2 \mathbb{I}(y = 0)] + 2\alpha \left( p(1 - p)m + \mathbb{E}[ps\mathbb{I}(y = 0) - (1 - p)s\mathbb{I}(y = 1)] \right) - p(1 - p)\alpha^2$$
+
+In `nn_AUCM_loss(version = "v1")`:
+* The prior $p$ is dynamically computed from each mini-batch via `positive_ratio(label_tensor)` when `imratio = NULL` (the default).
+* Alternatively, a fixed dataset-wide prior can be provided via `imratio = <value>` ($0 < p < 1$). If an invalid number ($p \le 0$ or $p \ge 1$) is supplied, an error is thrown.
+* Notice that every term in $\mathcal{L}_{v1}$ is scaled by $p(1 - p)$. When $p$ is very small, the overall loss and its gradients shrink proportionally to $p(1 - p)$.
+
+### AUCM v2: Class-Conditional Mean Formulation
+
+In AUCM v2, the objective replaces the prior-weighted joint expectations with direct class-conditional expectations:
+
+$$\mathcal{L}_{v2} = \mathbb{E}[(s - a)^2 \mid y = 1] + \mathbb{E}[(s - b)^2 \mid y = 0] + 2\alpha \left( m + \mathbb{E}[s \mid y = 0] - \mathbb{E}[s \mid y = 1] \right) - \alpha^2$$
+
+In `R/AUCM.R`, within-class expectations are computed using `class_mean(x, mask) = sum(x * mask) / sum(mask)`.
+
+### Mathematical Relationship and Conditions
+
+When the following conditions are met:
+1. Both classes are present in the batch ($N_+ > 0$ and $N_- > 0$),
+2. In v1, the prior $p$ equals the batch empirical positive ratio $\hat{p} = N_+ / N$ (the default when `imratio = NULL`),
+3. The predictions $\mathbf{s}$, labels $\mathbf{y}$, parameters ($a, b, \alpha$), and margin $m$ are identical,
+
+then the two versions are related exactly by:
+
+$$\mathcal{L}_{v2} = \frac{\mathcal{L}_{v1}}{p(1 - p)}$$
+
+If a fixed `imratio` $p \neq N_+ / N$ is explicitly provided to v1, this exact proportionality does not hold across individual batches.
+
+In `version = "v2"`, the `imratio` argument is ignored because class means are calculated directly without prior weighting.
+
+### Essential Mini-Batch Requirement for v2
+
+Because `class_mean` divides by the number of samples belonging to each class (`torch_sum(mask)`), **AUCM v2 requires that both classes are present in every mini-batch**.
+
+If a mini-batch contains only negative samples ($N_+ = 0$), dividing by zero produces `NaN` (`0 / 0`). This `NaN` immediately propagates into parameter gradients and corrupts model weights.
+
+For stochastic mini-batch training with AUCM v2, always use a batch sampler that guarantees both classes in every mini-batch:
+* `batch_sampler_dual`: Fixes the number of positive samples in every mini-batch (e.g. `sampling_rate = 0.5`), cycling and oversampling the minority class when needed.
+* `batch_sampler_stratified`: Guarantees at least `min_samples_per_stratum >= 1`.
+* Full-batch training (`batch_sampler_random(10000)`).
+
+---
+
+## Direct Tensor Demonstration
+
+Below we verify the mathematical relationship between v1 and v2 on synthetic score and label tensors:
+
 ```{r}
 torch_available <- requireNamespace("mlr3torch") && torch::torch_is_installed()
 if(torch_available){
-  L <- mlr3torch::LearnerTorchMLP$new(task_type="classif")
-  spam_dataset <- L$dataset(spam_sc_task)
+  pred_tensor <- torch::torch_tensor(c(0.1, 0.4, 0.35, 0.8))
+  label_tensor <- torch::torch_tensor(c(0, 0, 1, 1))
+
+  loss_v1 <- mlr3torchAUM::AUCM(pred_tensor, label_tensor, a = 0.3, b = 0.6, alpha = 0.5, margin = 1, version = "v1")$item()
+  loss_v2 <- mlr3torchAUM::AUCM(pred_tensor, label_tensor, a = 0.3, b = 0.6, alpha = 0.5, margin = 1, version = "v2")$item()
+
+  # Positive ratio p = 0.5, scaling factor p * (1 - p) = 0.25
+  p <- 0.5
+  cat("v1 loss:               ", loss_v1, "\n")
+  cat("v2 loss:               ", loss_v2, "\n")
+  cat("v1 / (p * (1 - p)):    ", loss_v1 / (p * (1 - p)), "\n")
+  cat("Absolute difference:   ", abs(loss_v2 - (loss_v1 / (p * (1 - p)))), "\n")
+
+  # Single-class batch behavior
+  single_class_label <- torch::torch_tensor(c(0, 0, 0, 0))
+  cat("Single-class batch v1: ", mlr3torchAUM::AUCM(pred_tensor, single_class_label, version = "v1")$item(), "\n")
+  cat("Single-class batch v2: ", mlr3torchAUM::AUCM(pred_tensor, single_class_label, version = "v2")$item(), "\n")
+}
+```
+
+The output confirms:
+1. `v2` matches `v1 / (p * (1 - p))` exactly when both classes are present.
+2. In a single-class batch, v1 evaluates to `0` (zero gradients), whereas v2 evaluates to `NaN` (due to division by zero in `class_mean`).
+
+### Property Summary
+
+| Property | AUCM v1 (`version = "v1"`) | AUCM v2 (`version = "v2"`) |
+|---|---|---|
+| **Objective formulation** | Prior-weighted joint expectation | Class-conditional expectation (`class_mean`) |
+| **Loss scale factor** | Proportional to $p(1 - p)$ | Scale-invariant (factor $p(1 - p)$ removed) |
+| **`imratio` parameter** | Used as prior $p$ (or estimated from batch) | Ignored (class means calculated directly) |
+| **Gradient scaling** | Proportional to prior factor $p(1 - p)$ | Independent of prior factor $p(1 - p)$ |
+| **Single-class batch** | Evaluates to 0 (finite) | Evaluates to `NaN` ($0 / 0$ in within-class mean) |
+| **Recommended samplers** | Any sampler (`random`, `dual`, `stratified`) | `batch_sampler_dual` or `batch_sampler_stratified` |
+| **LibAUC 2.0.1 fixes** | Faithful to LibAUC v1 | Corrects LibAUC v2 cross-term indexing and count flaws |
+
+---
+
+## Dataset Preparation: Imbalanced Spam Classification
+
+Below we create an imbalanced version of the classic spam dataset by filtering the positive class:
+
+```{r}
+spam_task <- mlr3::tsk("spam")
+spam_task$filter(1504:4293) # 310 spam (positives) vs 2480 nonspam (negatives)
+Class_vec <- spam_task$data(spam_task$row_ids, "type")$type
+(count_tab <- table(Class_vec))
+print(count_tab / sum(count_tab))
+
+library(data.table)
+orig_X_dt <- spam_task$data(spam_task$row_ids, spam_task$col_roles$feature)
+sc_X_dt <- data.table(type = Class_vec, scale(orig_X_dt))
+spam_sc_task <- mlr3::TaskClassif$new("spam_sc", sc_X_dt, target = "type")
+spam_sc_task$col_roles$stratum <- "type"
+spam_list <- list(task = spam_sc_task)
+```
+
+The filtered task contains 310 spam instances (approx. 11.1%) and 2480 nonspam instances (approx. 88.9%). Stratification ensures that validation splits preserve this imbalance ratio.
+
+---
+
+## Benchmark Experiments: AUCM v1 vs AUCM v2
+
+Below we run a systematic, reproducible benchmark comparing AUCM v1 and AUCM v2 across different sampling strategies under identical experimental conditions:
+
+* **Task**: Filtered imbalanced spam classification task (~11.1% minority class).
+* **Model**: `LearnerTorchMLP` with identical architecture and seed.
+* **Validation**: 50% stratified validation split (`set_validate(L, 0.5)`).
+* **Training Settings**: 20 epochs, identical PESG optimizer parameters.
+* **Configurations Evaluated**:
+  1. `v1_full`: AUCM v1 with full-batch gradient descent (`batch_sampler_random(10000)`).
+  2. `v2_full`: AUCM v2 with full-batch gradient descent (`batch_sampler_random(10000)`).
+  3. `v1_dual`: AUCM v1 with fixed-ratio dual sampler (`batch_sampler_dual(batch_size = 32, sampling_rate = 0.5)`).
+  4. `v2_dual`: AUCM v2 with fixed-ratio dual sampler (`batch_sampler_dual(batch_size = 32, sampling_rate = 0.5)`).
+  5. `v1_random_stoch`: AUCM v1 with stochastic mini-batch sampler (`batch_sampler_random(32)`).
+
+```{r}
+if(torch_available){
+  bench_configs <- list(
+    list(id = "v1_full",         version = "v1", sampler_name = "full"),
+    list(id = "v2_full",         version = "v2", sampler_name = "full"),
+    list(id = "v1_dual",         version = "v1", sampler_name = "dual"),
+    list(id = "v2_dual",         version = "v2", sampler_name = "dual"),
+    list(id = "v1_random_stoch", version = "v1", sampler_name = "random_stoch")
+  )
+
+  # Fresh sampler generator for each configuration run
+  get_sampler <- function(sampler_name){
+    switch(sampler_name,
+      full         = mlr3torchAUM::batch_sampler_random(10000),
+      dual         = mlr3torchAUM::batch_sampler_dual(batch_size = 32, sampling_rate = 0.5),
+      random_stoch = mlr3torchAUM::batch_sampler_random(32),
+      stop("Unknown sampler: ", sampler_name)
+    )
+  }
+
   measure_list <- list(
-    mlr3torchAUM::MeasureClassifInvAUC$new())
-  batch_sampler_list <- list(
-    random_full=mlr3torchAUM::batch_sampler_random(10000),
-    random_stoch=mlr3torchAUM::batch_sampler_random(9))
-  result_for_sampler <- function(batching){
-    L <- mlr3torch::LearnerTorchMLP$new(task_type="classif")
-    L$loss <- mlr3torchAUM::nn_AUCM_loss
+    mlr3torchAUM::MeasureClassifInvAUC$new(),
+    mlr3::msr("classif.auc")
+  )
+
+  run_single_benchmark <- function(cfg){
+    L <- mlr3torch::LearnerTorchMLP$new(task_type = "classif")
+
+    # Configure AUCM loss with requested version
+    torch_loss <- mlr3torch::as_torch_loss(mlr3torchAUM::nn_AUCM_loss)
+    torch_loss$param_set$set_values(margin = 1, version = cfg$version)
+    L$loss <- torch_loss
+
+    # Configure PESG optimizer for network weights
     opt <- mlr3torch::as_torch_optimizer(mlr3torchAUM::optim_pesg)
     opt$param_set$set_values(
       lr = 0.01, clamp_value = 1, weight_decay = 1e-4,
@@ -66,27 +235,93 @@ if(torch_available){
     )
     L$optimizer <- opt
     L$predict_type <- "prob"
-    L$callbacks <- list(mlr3torch::t_clbk("history"), 
-    mlr3torchAUM::make_pesg_callback_full(
-      lr = 0.01, clamp_value = 1, weight_decay = 1e-4,
-      epoch_decay = 1e-3, momentum = 0.9, decay_factor = 2
-    ))
+
+    # Configure PESG callback for loss parameters
+    L$callbacks <- list(
+      mlr3torch::t_clbk("history"),
+      mlr3torchAUM::make_pesg_callback_full(
+        lr = 0.01, clamp_value = 1, weight_decay = 1e-4,
+        epoch_decay = 1e-3, momentum = 0.9, decay_factor = 2
+      )
+    )
+
     L$param_set$set_values(
-      epochs=20, batch_size=32, seed=1,
-      measures_valid=measure_list,
-      measures_train=measure_list,
-      batch_sampler=batch_sampler_list[[batching]])
+      epochs = 20, batch_size = 32, seed = 1,
+      measures_valid = measure_list,
+      measures_train = measure_list,
+      batch_sampler = get_sampler(cfg$sampler_name)
+    )
+
     set.seed(1)
     mlr3::set_validate(L, 0.5)
+
+    time_start <- proc.time()
     L$train(spam_sc_task)
-    print(L$model$loss_fn)
+    time_elapsed <- as.numeric((proc.time() - time_start)[["elapsed"]])
+
+    lf <- L$model$loss_fn
+    hist <- L$model$callbacks$history
+    final_epoch <- hist[nrow(hist), ]
+
+    val_auc <- if("val.classif.auc" %in% names(final_epoch)) {
+      final_epoch[["val.classif.auc"]]
+    } else {
+      NA_real_
+    }
+    val_inv_auc <- if("val.classif.invauc" %in% names(final_epoch)) {
+      final_epoch[["val.classif.invauc"]]
+    } else {
+      NA_real_
+    }
+
     list(
-      loss=sapply(L$model$loss_fn, torch::as_array),
-      history=data.table(batching, L$model$callbacks$history),
-      weights=torch::as_array(L$model$network$parameters[["0.weight"]]$flatten()))
+      summary = data.table(
+        id          = cfg$id,
+        version     = cfg$version,
+        sampler     = cfg$sampler_name,
+        val_auc     = round(val_auc, 4),
+        val_inv_auc = round(val_inv_auc, 4),
+        a_pos       = round(as.numeric(lf$a), 4),
+        b_neg       = round(as.numeric(lf$b), 4),
+        alpha       = round(as.numeric(lf$alpha), 4),
+        seconds     = round(time_elapsed, 2)
+      ),
+      weights = torch::as_array(L$model$network$parameters[["0.weight"]]$flatten())
+    )
   }
-  result_list <- lapply(names(batch_sampler_list), result_for_sampler)
-  names(result_list) <- names(batch_sampler_list)
-  print(do.call(data.table, lapply(result_list, "[[", "weights")), nrow=10)
+
+  bench_outputs <- lapply(bench_configs, run_single_benchmark)
+  bench_results <- rbindlist(lapply(bench_outputs, "[[", "summary"))
+  print(bench_results)
+
+  # Inspect first layer learned weights across configurations
+  weight_cols <- lapply(bench_outputs, "[[", "weights")
+  names(weight_cols) <- sapply(bench_configs, "[[", "id")
+  print(do.call(data.table, weight_cols), nrows = 10)
 }
 ```
+
+---
+
+## Interpretation of Results and Practical Guidelines
+
+The benchmark experiment above provides a comparative overview of AUCM v1 and AUCM v2 across batching strategies:
+
+1. **Class Centers ($a$ and $b$):** The parameters $a$ and $b$ track the surrogate score centers for the positive and negative classes. When training successfully differentiates the two classes, $a$ is expected to be higher than $b$ ($a > b$), indicating that positive samples receive higher predicted probability scores than negative samples.
+2. **Dual Variable ($\alpha$):** The parameter $\alpha \ge 0$ is the Lagrange multiplier enforcing the separation constraint $a - b \ge m$. A positive value indicates that the optimizer continues to push the class centers apart toward the desired margin $m$.
+3. **Validation AUC and InvAUC:** The metrics `val_auc` and `val_inv_auc` reflect discrimination performance on the held-out validation fold ($1 - \text{AUC}$). Higher validation AUC indicates better ranking of positive over negative observations.
+4. **Mini-Batch Compatibility:** As shown mathematically, AUCM v2 divides by within-class sample counts. Consequently, v2 requires mini-batches containing both classes to prevent $0 / 0 = \text{NaN}$. In stochastic settings, `batch_sampler_dual` (or `batch_sampler_stratified`) ensures this requirement is met on every iteration.
+5. **Runtime Measurements:** The elapsed time column allows comparing the computational efficiency of full-batch versus mini-batch sampling schemes.
+
+### Practical Guidelines for Practitioners
+
+* **Choosing AUCM v2:** Recommended when working across tasks with varying class imbalance ratios, as within-class normalization avoids the $p(1 - p)$ loss shrinkage inherent to v1.
+* **Sampler Selection with v2:** Always pair AUCM v2 with `batch_sampler_dual` or `batch_sampler_stratified` in mini-batch training to ensure valid class-conditional means across all iterations.
+* **Optimization Setup:** Both AUCM versions require training with `optim_pesg` and `make_pesg_callback_full` (or `make_pesg_callback`) so that the auxiliary parameters $a, b$, and $\alpha$ are updated alongside the neural network weights.
+
+---
+
+## References
+
+* Yuan, Z., Yan, Y., Sonka, M., Yang, T. (2021). *Large-scale Robust Deep AUC Maximization: A New Surrogate Loss and Empirical Studies on Medical Image Classification*. International Conference on Computer Vision (ICCV 2021). [arXiv:2012.03173](https://arxiv.org/abs/2012.03173).
+* LibAUC Library: [https://libauc.org/](https://libauc.org/)
